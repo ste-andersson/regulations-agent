@@ -90,10 +90,12 @@
             <optional>true</optional>
         </dependency>
 
-        <!-- Auto-loads backend/.env into the Spring Environment for local dev -->
+        <!-- Auto-loads backend/.env into the Spring Environment for local dev.
+             Must be the "springboot3-dotenv" artifact, not plain "spring-dotenv" (that one is
+             the Spring-Framework-only core lib with no Spring Boot auto-registration). -->
         <dependency>
             <groupId>me.paulschwarz</groupId>
-            <artifactId>spring-dotenv</artifactId>
+            <artifactId>springboot3-dotenv</artifactId>
             <version>5.1.0</version>
         </dependency>
 
