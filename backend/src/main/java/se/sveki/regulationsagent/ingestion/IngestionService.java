@@ -1,5 +1,6 @@
 package se.sveki.regulationsagent.ingestion;
 
+import com.datastax.astra.client.core.query.Filters;
 import com.datastax.astra.langchain4j.store.embedding.AstraDbEmbeddingStore;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.data.document.Metadata;
@@ -70,6 +71,13 @@ public class IngestionService {
                             + "cannot commit. Preview still works without it.");
         }
         PreviewResult preview = preview(markdownFile);
+
+        // addAll() always generates fresh Astra document IDs (it has no concept of "this chunk
+        // already exists, replace it") - re-committing the same document without first deleting
+        // its previous chunks would silently accumulate duplicates on every re-ingestion. Deleting
+        // by document_id first makes commit() idempotent, matching how re-running ingestion after
+        // fixing a bug (e.g. a chunk-classification heuristic) is expected to behave.
+        embeddingStore.astraDBCollection().deleteMany(Filters.eq("document_id", preview.meta().documentId()));
 
         List<TextSegment> segments = new ArrayList<>(preview.chunks().size());
         for (Chunk chunk : preview.chunks()) {

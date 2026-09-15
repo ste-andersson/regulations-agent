@@ -122,12 +122,19 @@ public class MarkdownChunkAssembler {
 
     private ChunkType classify(List<HeadingEntry> headingStack) {
         // Keyword list is intentionally bilingual: source documents are in both Swedish
-        // ("grepp", "förkortning", "ordlista") and English ("abbreviation", "glossary"),
-        // and headings must be matched in whichever language the source document uses.
+        // ("förkortning", "ordlista") and English ("abbreviation", "glossary"), and headings
+        // must be matched in whichever language the source document uses.
+        //
+        // Deliberately narrow: an earlier version also matched "definition" and "grepp", which
+        // seemed reasonable (BRR abbreviations are introduced as inline "X = Y" definitions) but
+        // in practice false-matched BRR's B7.7.1-3 "Definition av grepp/rotation/akrobatik ej
+        // tillåten" headings - substantive acrobatics safety RULES, not an abbreviation glossary.
+        // That mislabeling polluted retrieval's always-include-glossary results with irrelevant
+        // acrobatics content on unrelated questions (e.g. "how many judges are required?").
         for (HeadingEntry entry : headingStack) {
             String lower = entry.title().toLowerCase();
-            if (lower.contains("definition") || lower.contains("grepp") || lower.contains("förkortning")
-                    || lower.contains("abbreviat") || lower.contains("glossary") || lower.contains("ordlista")) {
+            if (lower.contains("förkortning") || lower.contains("abbreviat")
+                    || lower.contains("glossary") || lower.contains("ordlista")) {
                 return ChunkType.GLOSSARY;
             }
         }
