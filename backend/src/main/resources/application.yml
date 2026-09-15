@@ -1,0 +1,43 @@
+spring:
+  application:
+    name: regulations-agent-backend
+  datasource:
+    url: jdbc:h2:file:./data/regulations-agent;AUTO_SERVER=TRUE
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+  servlet:
+    multipart:
+      max-file-size: 20MB
+      max-request-size: 20MB
+
+server:
+  port: ${SERVER_PORT:8080}
+
+app:
+  openai:
+    api-key: ${OPENAI_API_KEY:}
+    chat-model: gpt-4o-mini
+    embedding-model: text-embedding-3-small
+    embedding-dimension: 1536
+  astra:
+    application-token: ${ASTRA_DB_APPLICATION_TOKEN:}
+    api-endpoint: ${ASTRA_DB_API_ENDPOINT:}
+    keyspace: ${ASTRA_DB_KEYSPACE:default_keyspace}
+    collection: ${ASTRA_DB_COLLECTION:regulation_chunks}
+  langfuse:
+    public-key: ${LANGFUSE_PUBLIC_KEY:}
+    secret-key: ${LANGFUSE_SECRET_KEY:}
+    host: ${LANGFUSE_HOST:https://cloud.langfuse.com}
+  admin:
+    api-key: ${ADMIN_API_KEY:}
+  sources:
+    directory: ${SOURCES_DIRECTORY:../docs/sources}
+
+logging:
+  level:
+    se.sveki.regulationsagent: DEBUG
