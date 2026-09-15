@@ -1,5 +1,6 @@
 package se.sveki.regulationsagent.rag;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.SystemMessage;
@@ -8,7 +9,12 @@ import dev.langchain4j.memory.ChatMemory;
 import dev.langchain4j.memory.chat.MessageWindowChatMemory;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.response.ChatResponse;
+import dev.langchain4j.model.output.TokenUsage;
 import dev.langchain4j.rag.content.Content;
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.api.trace.Tracer;
+import io.opentelemetry.context.Context;
+import se.sveki.regulationsagent.config.AppProperties;
 import org.springframework.lang.Nullable;
 import org.springframework.stereotype.Service;
 
@@ -35,16 +41,24 @@ public class RagChatService {
     private final RegulationContentRetriever contentRetriever;
     private final QueryExpansionService queryExpansionService;
     private final ChatModel chatModel;
+    private final String chatModelName;
     private final String systemPromptTemplate;
     private final Map<String, ChatMemory> conversationMemories = new ConcurrentHashMap<>();
+    @Nullable
+    private final Tracer tracer;
+    private final ObjectMapper objectMapper = new ObjectMapper();
 
     public RagChatService(RegulationContentRetriever contentRetriever,
                            QueryExpansionService queryExpansionService,
-                           ChatModel chatModel) {
+                           ChatModel chatModel,
+                           AppProperties props,
+                           @Nullable Tracer tracer) {
         this.contentRetriever = contentRetriever;
         this.queryExpansionService = queryExpansionService;
         this.chatModel = chatModel;
+        this.chatModelName = props.openai().chatModel();
         this.systemPromptTemplate = loadSystemPrompt();
+        this.tracer = tracer;
     }
 
     public RagChatResult chat(@Nullable String conversationId, String message, @Nullable List<String> documentFilter) {
@@ -56,23 +70,112 @@ public class RagChatService {
         String id = (conversationId == null || conversationId.isBlank()) ? UUID.randomUUID().toString() : conversationId;
         ChatMemory memory = conversationMemories.computeIfAbsent(id, key -> MessageWindowChatMemory.withMaxMessages(10));
 
-        String expandedQuery = queryExpansionService.expandForSearch(message);
-        List<Content> retrieved = contentRetriever.retrieve(expandedQuery, documentFilter);
+        Span trace = startSpan("rag-chat", null);
+        setAttribute(trace, "langfuse.trace.name", "rag-chat");
+        setAttribute(trace, "langfuse.session.id", id);
+        setAttribute(trace, "langfuse.observation.input", toJson(message));
+        try {
+            String expandedQuery = queryExpansionService.expandForSearch(message);
 
-        String systemPrompt = systemPromptTemplate + "\n\nCONTEXT:\n" + formatContext(retrieved);
+            Span retrievalSpan = startSpan("retrieval", trace);
+            setAttribute(retrievalSpan, "langfuse.observation.type", "retriever");
+            setAttribute(retrievalSpan, "langfuse.observation.input", toJson(expandedQuery));
+            List<Content> retrieved = contentRetriever.retrieve(expandedQuery, documentFilter);
+            setAttribute(retrievalSpan, "langfuse.observation.output", toJson(retrievalSummary(retrieved)));
+            endSpan(retrievalSpan);
 
-        List<ChatMessage> messages = new ArrayList<>();
-        messages.add(SystemMessage.from(systemPrompt));
-        messages.addAll(memory.messages());
-        messages.add(UserMessage.from(message));
+            String systemPrompt = systemPromptTemplate + "\n\nCONTEXT:\n" + formatContext(retrieved);
 
-        ChatResponse response = chatModel.chat(messages);
-        String answer = response.aiMessage().text();
+            List<ChatMessage> messages = new ArrayList<>();
+            messages.add(SystemMessage.from(systemPrompt));
+            messages.addAll(memory.messages());
+            messages.add(UserMessage.from(message));
 
-        memory.add(UserMessage.from(message));
-        memory.add(AiMessage.from(answer));
+            Span generationSpan = startSpan("generation", trace);
+            setAttribute(generationSpan, "langfuse.observation.type", "generation");
+            setAttribute(generationSpan, "langfuse.observation.model.name", chatModelName);
+            setAttribute(generationSpan, "gen_ai.request.model", chatModelName);
+            setAttribute(generationSpan, "langfuse.observation.input", toJson(promptSummary(messages)));
 
-        return new RagChatResult(id, answer, buildCitations(retrieved));
+            ChatResponse response = chatModel.chat(messages);
+            String answer = response.aiMessage().text();
+
+            setAttribute(generationSpan, "langfuse.observation.output", toJson(answer));
+            TokenUsage tokenUsage = response.tokenUsage();
+            if (tokenUsage != null) {
+                if (tokenUsage.inputTokenCount() != null) {
+                    setLongAttribute(generationSpan, "gen_ai.usage.input_tokens", tokenUsage.inputTokenCount());
+                }
+                if (tokenUsage.outputTokenCount() != null) {
+                    setLongAttribute(generationSpan, "gen_ai.usage.output_tokens", tokenUsage.outputTokenCount());
+                }
+            }
+            endSpan(generationSpan);
+
+            memory.add(UserMessage.from(message));
+            memory.add(AiMessage.from(answer));
+
+            setAttribute(trace, "langfuse.observation.output", toJson(answer));
+            return new RagChatResult(id, answer, buildCitations(retrieved));
+        } finally {
+            endSpan(trace);
+        }
+    }
+
+    @Nullable
+    private Span startSpan(String name, @Nullable Span parent) {
+        if (tracer == null) {
+            return null;
+        }
+        var builder = tracer.spanBuilder(name);
+        if (parent != null) {
+            builder.setParent(parent.storeInContext(Context.root()));
+        }
+        return builder.startSpan();
+    }
+
+    private void setAttribute(@Nullable Span span, String key, String value) {
+        if (span != null) {
+            span.setAttribute(key, value);
+        }
+    }
+
+    private void setLongAttribute(@Nullable Span span, String key, long value) {
+        if (span != null) {
+            span.setAttribute(key, value);
+        }
+    }
+
+    private void endSpan(@Nullable Span span) {
+        if (span != null) {
+            span.end();
+        }
+    }
+
+    private String toJson(String value) {
+        try {
+            return objectMapper.writeValueAsString(value);
+        } catch (IOException e) {
+            return "\"\"";
+        }
+    }
+
+    private String retrievalSummary(List<Content> retrieved) {
+        List<String> summary = new ArrayList<>();
+        for (Content content : retrieved) {
+            var metadata = content.textSegment().metadata();
+            summary.add(metadata.getString("document_id") + "#"
+                    + (metadata.getString("section_number") != null ? metadata.getString("section_number") : "?"));
+        }
+        return String.join(", ", summary);
+    }
+
+    private String promptSummary(List<ChatMessage> messages) {
+        // The full system prompt (with the whole retrieved CONTEXT block) is long and would
+        // duplicate what the "retrieval" span already records - the generation span's input just
+        // needs to show what was actually asked, for readability in the Langfuse UI.
+        ChatMessage last = messages.get(messages.size() - 1);
+        return last instanceof UserMessage userMessage ? userMessage.singleText() : last.toString();
     }
 
     private List<Citation> buildCitations(List<Content> retrieved) {

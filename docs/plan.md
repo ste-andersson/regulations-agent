@@ -58,7 +58,7 @@ repo/
 │   │   │                   RegulationDocument (JPA entity)
 │   │   ├── rag/            RegulationAssistant (AiServices), RegulationContentRetriever,
 │   │   │                   QueryExpansionService
-│   │   ├── tracing/        LangfuseChatModelListener, LangfuseClient
+│   │   ├── tracing/        LangfuseTracingConfig
 │   │   └── web/            ChatController, AdminIngestionController
 │   └── src/main/resources/application*.yml, prompts/system-prompt.txt
 └── frontend/  (React + TS + Vite)
@@ -127,9 +127,35 @@ The backend now only needs to understand **one single, simple format**: committe
 
 ## Langfuse integration
 
-**Risk flag:** LangChain4j lacks a first-party Langfuse integration (unlike Python/JS LangChain). Recommended approach: register a custom `LangfuseChatModelListener implements ChatModelListener` (`onRequest`/`onResponse`/`onError`) on `OpenAiChatModel`, which sends trace/span/generation events to Langfuse's public ingestion API (`POST {LANGFUSE_HOST}/api/public/ingestion`) via a small `LangfuseClient`. One trace per chat call, one span for the retrieval step (requires a manual wrapper `TracingContentRetriever` around `EmbeddingStoreContentRetriever` since there's no equivalent listener SPI for retrieval), one generation for the LLM call (incl. `TokenUsage`).
+**Implemented via plain OpenTelemetry, not the legacy REST ingestion API.** The original plan
+considered a custom `LangfuseChatModelListener`/`LangfuseClient` posting directly to
+`POST /api/public/ingestion`, but that endpoint is deprecated and scheduled for sunset on
+Langfuse Cloud (2026-11-16) in favor of Langfuse's OTLP endpoint. Since LangChain4j has no
+first-party Langfuse integration either way, OpenTelemetry (a stable, well-documented Java
+ecosystem) ended up being the *more* reliable path, not just a speculative fallback.
 
-Alternative (more speculative): OpenTelemetry against Langfuse's OTLP endpoint — only worth considering if you already have OTel infrastructure. Do a short spike in Phase 3 to verify the exact API shapes (both LangChain4j's `ChatModelListener` signature and Langfuse's ingestion schema, since both evolve quickly).
+`LangfuseTracingConfig` builds a plain OTel `Tracer` (`io.opentelemetry:opentelemetry-sdk` +
+`opentelemetry-exporter-otlp`, using `OtlpHttpSpanExporter` — Langfuse only accepts OTLP/HTTP,
+not gRPC) pointed at `{LANGFUSE_HOST}/api/public/otel/v1/traces` with HTTP Basic Auth
+(`base64(publicKey:secretKey)`). Returns `null` when Langfuse isn't configured, same pattern as
+`AstraDbConfig`.
+
+`RagChatService` creates three spans per chat turn, using Langfuse's own OTel attribute
+conventions (`langfuse.trace.name`, `langfuse.session.id`, `langfuse.observation.type`,
+`langfuse.observation.input`/`output`, plus the standard `gen_ai.request.model` and
+`gen_ai.usage.input_tokens`/`output_tokens` for the generation span so Langfuse can compute cost):
+- A root span (`rag-chat`) tagged with the conversation ID as the session.
+- A child `retrieval` span (`langfuse.observation.type = "retriever"`) recording the expanded
+  query and a summary of which `document_id#section_number`s were retrieved.
+- A child `generation` span (`langfuse.observation.type = "generation"`) recording the model
+  name, the user's question, the answer, and token usage.
+
+**Verified for real**, not just assumed to work: after wiring this up, a live chat request was
+confirmed to land correctly in Langfuse by querying its own public read API
+(`GET /api/public/traces`, `GET /api/public/observations/{id}`) — the trace showed the correct
+input/output, the retrieval observation came back typed as `RETRIEVER`, the generation
+observation came back typed as `GENERATION` with `model: gpt-4o-mini` and real token counts, and
+Langfuse had auto-computed a cost from those tokens.
 
 Config: `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_HOST`.
 
@@ -143,12 +169,12 @@ Environment variables: `OPENAI_API_KEY`, `ASTRA_DB_APPLICATION_TOKEN`, `ASTRA_DB
 
 ## Build order (phases)
 
-1. **Phase 0 — Convert source documents + scaffolding.** Convert the five existing sources to Markdown (see the section above), review them against the originals, commit to `docs/sources/`. In parallel: `git init`, Spring Initializr backend, Vite frontend, `.gitignore`/`.env.example`. *Verify:* spot-check each `.md` file against the original (headings, a couple of known table rows), backend starts and responds on the health endpoint, frontend runs `npm run dev`.
-2. **Phase 1 — Backend skeleton + Astra connection + ingestion of the BRR regulations' `.md` file + a simple non-RAG chat.** Astra DB spike (create collection, read/write a test vector, verify `Filter`). Build `MarkdownChunkAssembler`. *Verify:* `/api/admin/documents/preview` returns correct section numbers/pages/table transcriptions for spot checks (e.g. B4.5.1).
-3. **Phase 2 — RAG retrieval with citations.** Build the retriever, glossary inclusion, query expansion, system prompt, citations DTO. *Verify:* ask real questions (see below) and check that both the answer and the `sectionNumber`/`pageNumber` match the PDF.
-4. **Phase 3 — Langfuse tracing.** *Verify:* a chat request produces a trace in the Langfuse dashboard with a retrieval span and a generation span including token usage.
+1. **Phase 0 — Convert source documents + scaffolding.** ✅ Done. Convert the five existing sources to Markdown (see the section above), review them against the originals, commit to `docs/sources/`. In parallel: `git init`, Spring Initializr backend, Vite frontend, `.gitignore`/`.env.example`. *Verified:* every `.md` file spot-checked against the original; backend starts and responds on the health endpoint. (Frontend scaffolding deferred to Phase 4.)
+2. **Phase 1 — Backend skeleton + Astra connection + ingestion + a simple non-RAG chat.** ✅ Done. Astra DB spike, `MarkdownChunkAssembler` built. *Verified:* `/api/admin/documents/preview` and `/commit` both run against the real Astra DB/OpenAI account for all five documents (279 chunks total) with correct section numbers/pages/table transcriptions.
+3. **Phase 2 — RAG retrieval with citations.** ✅ Done. Retriever, glossary inclusion, query expansion, system prompt, citations DTO built. *Verified* against real questions (see below) with correct `sectionNumber`/`pageNumber` citations, including a citation-hallucination bug (fabricated page/section numbers for the page-less ILHC source) and an over-broad glossary-detection heuristic (falsely classifying BRR's acrobatics safety rules as a glossary) — both found through live testing and fixed.
+4. **Phase 3 — Langfuse tracing.** ✅ Done. *Verified:* a chat request produces a trace in Langfuse with a `RETRIEVER` observation and a `GENERATION` observation including model name, token usage, and an auto-computed cost — confirmed by reading it back via Langfuse's own public API, not just checked in the dashboard.
 5. **Phase 4 — React frontend.** *Verify:* manual UI walkthrough, citation badges render correctly, conversation context is preserved across turns.
-6. **Phase 5 — Support for multiple documents.** Ingest the four added sources (already converted in Phase 0: WRRC Lindy Hop Rules, WRRC judging guidelines, the Nordic Championship rules, the ILHC page) via the admin workflow, one at a time, reviewing the preview result per document. Verify that `documentFilter` correctly scopes retrieval without cross-contamination between documents, and that the cross-source conflict handling in the system prompt (see the RAG query flow) works when a question touches several rule sets at once.
+6. **Phase 5 — Support for multiple documents.** ✅ Done (ingestion side; `documentFilter` scoping itself is untested in isolation). All five sources are ingested. *Verified:* the cross-source conflict handling works — e.g. asking about Bugg step regulations with no document filter produced an answer that clearly separated "According to the Nordic Championship rules: ..." from "According to the BRR regulations: ...", each with correct distinct citations, rather than blending them.
 
 ## Verification — example questions
 
@@ -171,5 +197,6 @@ After Phase 5 (multiple documents, including the four added WRRC/Nordic/ILHC sou
 - `backend/.../ingestion/MarkdownChunkAssembler.java` — builds the section tree/breadcrumb and chunks from the Markdown AST (incl. page-marker parsing and table handling); the most central piece of ingestion, though lower risk now than a bespoke PDF parser would have been.
 - `backend/.../rag/RegulationContentRetriever.java` — retrieval logic (metadata filter, glossary inclusion, abbreviation expansion) that determines citation correctness.
 - `backend/.../resources/prompts/system-prompt.txt` — the system prompt controlling citation format, cross-source conflict handling between rule sets, and "out of scope" handling.
-- `backend/.../config/AstraDbConfig.java` — Astra connection/collection wiring, the first thing to validate in the Phase 1 spike.
-- `backend/.../tracing/LangfuseChatModelListener.java` — the Langfuse integration point, flagged as a spike/risk area.
+- `backend/.../config/AstraDbConfig.java` — Astra connection/collection wiring, the first thing validated in the Phase 1 spike.
+- `backend/.../tracing/LangfuseTracingConfig.java` — the Langfuse integration point (via plain OpenTelemetry), verified end-to-end by reading traces back through Langfuse's own public API.
+- `backend/.../ingestion/IngestionService.java` — `commit()` deletes a document's existing chunks before re-inserting; without that, re-running ingestion after any fix silently duplicates chunks forever, since `AstraDbEmbeddingStore.addAll()` always generates fresh IDs.

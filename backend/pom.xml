@@ -22,6 +22,7 @@
         <langchain4j.version>1.17.0</langchain4j.version>
         <astradb.version>2.3.2</astradb.version>
         <flexmark.version>0.64.8</flexmark.version>
+        <opentelemetry.version>1.66.0</opentelemetry.version>
     </properties>
 
     <dependencies>
@@ -82,6 +83,22 @@
             <groupId>com.vladsch.flexmark</groupId>
             <artifactId>flexmark-all</artifactId>
             <version>${flexmark.version}</version>
+        </dependency>
+
+        <!-- Langfuse tracing, via plain OpenTelemetry OTLP/HTTP (see docs/plan.md, "Langfuse
+             integration" - LangChain4j has no first-party Langfuse SDK, and Langfuse's legacy
+             REST ingestion API is being sunset in favor of OTLP, so OTel is the primary path,
+             not just a fallback). opentelemetry-exporter-otlp bundles both the gRPC and the
+             HTTP/protobuf span exporters; Langfuse only accepts HTTP (no gRPC). -->
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-sdk</artifactId>
+            <version>${opentelemetry.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-exporter-otlp</artifactId>
+            <version>${opentelemetry.version}</version>
         </dependency>
 
         <dependency>
